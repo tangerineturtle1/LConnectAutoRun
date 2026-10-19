@@ -1,6 +1,6 @@
 # LConnectAutoRun
 
-**Version 1.0.0** · Windows · for Lian Li L-Connect 3
+**Version 1.1.0** · Windows · for Lian Li L-Connect 3
 
 Applies your L-Connect lighting, fan and LCD profiles **invisibly at boot**, then closes L-Connect, so it isn't sitting in the background. The L-Connect service keeps running so your fan curves still work.
 
@@ -8,7 +8,7 @@ Applies your L-Connect lighting, fan and LCD profiles **invisibly at boot**, the
 
 - **At boot** (before you log in, with no windows): makes sure the L-Connect service is running, opens L-Connect hidden so it applies your profiles, then closes the app.
 - **Stops L-Connect and OpenRGB from starting with Windows** on their own. This is checked again every boot, in case L-Connect turns them back on.
-- **Disables the L-Connect service watcher.** The main service stays on.
+- **Keeps the L-Connect service alive.** Windows restarts it if it crashes. If it restarts while you're using the PC, your profiles are re-applied in the background, so the fans don't fall back to full speed.
 - **OpenRGB only runs while the L-Connect app is open,** and is stopped when you close the app. Any other time, launches of OpenRGB.exe are blocked.
 
 ## Install

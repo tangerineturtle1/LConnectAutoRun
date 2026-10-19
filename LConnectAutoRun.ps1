@@ -16,7 +16,8 @@
     Install also:
       - turns off L-Connect's and OpenRGB's own "start with Windows" entries
         (re-checked every boot, in case L-Connect turns them back on)
-      - disables the L-Connect service watcher (the main service stays on)
+      - keeps the L-Connect service alive: Windows restarts it if it crashes, and your
+        profiles are re-applied (hidden) whenever the service restarts mid-session
       - gates OpenRGB.exe: it may only run while the L-Connect app is open, and is
         stopped when the app closes. Any other time it is blocked from launching.
     Uninstall turns all of that back on.
@@ -28,6 +29,7 @@ param(
     [switch]$Install,
     [switch]$Uninstall,
     [switch]$Diagnose,               # test the OpenRGB gate and write findings to the log
+    [switch]$Reapply,                # set by the service-restart task: re-push profiles mid-session
     [int]$ApplySeconds = 25,         # how long L-Connect stays open to apply settings
     [int]$ServiceSettleSeconds = 10, # extra wait after the service starts, before the app opens
     [string]$LConnectPath = ""       # leave blank to auto-detect
@@ -35,6 +37,7 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $TaskName     = 'L-Connect Apply and Exit'
+$ReapplyTask  = 'L-Connect Reapply After Service Restart'
 $OldOpenTask  = 'L-Connect Open'       # from an earlier version; removed on install/uninstall
 $OldShortcut  = 'Open L-Connect.lnk'   # from an earlier version; removed on install/uninstall
 $InstallDir   = Join-Path $env:ProgramData 'LConnectAutoRun'
@@ -127,22 +130,7 @@ function Test-Watcher($Svc) {
     return $false
 }
 
-# Stop and disable the service watcher; remember its original startup type for Uninstall.
-function Disable-Watcher {
-    $watchers = @(Get-LConnectServices | Where-Object { Test-Watcher $_ })
-    if (-not $watchers) { Write-Host 'No L-Connect service watcher found (nothing to disable).'; return }
-    # Only record the original state the first time, so a reinstall doesn't save "Disabled"
-    if (-not (Test-Path $WatcherFile)) {
-        $orig = @($watchers | ForEach-Object { @{ Name = $_.Name; StartType = [string]$_.StartType } })
-        ConvertTo-Json -InputObject $orig | Set-Content -Path $WatcherFile
-    }
-    foreach ($w in $watchers) {
-        Stop-Service -Name $w.Name -Force -ErrorAction SilentlyContinue
-        Set-Service -Name $w.Name -StartupType Disabled
-        Write-Host "Disabled service watcher: $($w.DisplayName)"
-    }
-}
-
+# Earlier versions disabled the service watcher; put it back the way it was.
 function Restore-Watcher {
     if (-not (Test-Path $WatcherFile)) { return }
     foreach ($w in (Get-Content $WatcherFile -Raw | ConvertFrom-Json)) {
@@ -239,7 +227,7 @@ function Disable-LConnectAutostart {
         }
     }
     foreach ($t in Get-ScheduledTask -ErrorAction SilentlyContinue) {
-        if ($t.TaskName -in @($TaskName, $OldOpenTask) -or $t.State -eq 'Disabled') { continue }
+        if ($t.TaskName -in @($TaskName, $ReapplyTask, $OldOpenTask) -or $t.State -eq 'Disabled') { continue }
         if ((Test-AutostartName $t.TaskName) -or ($t.Actions | Where-Object { Test-AutostartName ([string]$_.Execute) })) {
             Disable-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath | Out-Null
             $changed += @{ Kind = 'Task'; Name = $t.TaskName; Path = $t.TaskPath }
@@ -519,6 +507,34 @@ function Initialize-Log {
     & icacls.exe $LogFile /grant '*S-1-5-32-545:M' /Q 2>&1 | Out-Null
 }
 
+# If the L-Connect service crashes, Windows restarts it (5 s, 5 s, then 30 s)
+function Set-ServiceRecovery {
+    foreach ($svc in Get-LConnectServices | Where-Object { -not (Test-Watcher $_) }) {
+        & sc.exe failure $svc.Name reset= 86400 actions= restart/5000/restart/5000/restart/30000 | Out-Null
+        Write-Host "Service $($svc.Name) will restart itself if it crashes."
+    }
+}
+
+# Whenever the L-Connect service stops or starts mid-session, re-apply the profiles
+# (hidden, same as at boot). Without this, a service restart leaves the fans on the
+# hub's default curve until the next reboot.
+function Register-ReapplyTask($Settings, $Principal, [string[]]$BaseArgs) {
+    $svc = Get-LConnectServices | Where-Object { -not (Test-Watcher $_) } | Select-Object -First 1
+    if (-not $svc) { Write-Host 'No L-Connect service found; skipping the service-restart task.'; return }
+    $name = [Security.SecurityElement]::Escape($svc.DisplayName)
+    $xpath = "*[System[Provider[@Name='Service Control Manager'] and EventID=7036]] and *[EventData[Data[@Name='param1']='$name']]"
+    $cls = Get-CimClass -Namespace 'Root/Microsoft/Windows/TaskScheduler' -ClassName MSFT_TaskEventTrigger
+    $trigger = New-CimInstance -CimClass $cls -ClientOnly
+    $trigger.Enabled = $true
+    $trigger.Delay = 'PT20S'
+    $trigger.Subscription = "<QueryList><Query Id=`"0`" Path=`"System`"><Select Path=`"System`">$xpath</Select></Query></QueryList>"
+    $args2 = $BaseArgs + '-Reapply'
+    Register-ScheduledTask -TaskName $ReapplyTask -Force -Settings $Settings -Trigger $trigger `
+        -Action (New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ($args2 -join ' ')) `
+        -Principal $Principal -ErrorAction Stop | Out-Null
+    Write-Host "Profiles will be re-applied automatically if '$($svc.DisplayName)' restarts."
+}
+
 function Remove-OldVersionLeftovers {
     Unregister-ScheduledTask -TaskName $OldOpenTask -Confirm:$false -ErrorAction SilentlyContinue
     @([Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('Programs')) |
@@ -600,6 +616,7 @@ if ($Diagnose) {
 if ($Uninstall) {
     Repair-InstallDir
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $ReapplyTask -Confirm:$false -ErrorAction SilentlyContinue
     Remove-OldVersionLeftovers
     Restore-LConnectAutostart
     Restore-Watcher
@@ -637,11 +654,12 @@ if ($Install) {
     # without storing your password (and it uses your saved L-Connect profiles)
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $trigger.Delay = 'PT30S'   # give USB devices time to come up
+    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Highest
     try {
         Register-ScheduledTask -TaskName $TaskName -Force -Settings $settings -Trigger $trigger `
             -Action (New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ($argList -join ' ')) `
-            -Principal (New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Highest) `
-            -ErrorAction Stop | Out-Null
+            -Principal $principal -ErrorAction Stop | Out-Null
+        Register-ReapplyTask $settings $principal $argList
     } catch {
         Write-Host "Couldn't create the boot task: $($_.Exception.Message)" -ForegroundColor Red
         Write-Host 'Nothing else was changed.'
@@ -651,7 +669,8 @@ if ($Install) {
 
     Remove-OldVersionLeftovers
     Disable-LConnectAutostart
-    Disable-Watcher
+    Restore-Watcher        # an earlier version disabled it; it restarts the service if it dies
+    Set-ServiceRecovery
     Set-OpenRGBGate -Rebuild
 
     # An earlier version stopped the service; bring it back now so the fans calm down
@@ -667,7 +686,18 @@ if ($Install) {
 
 # ---------------------------------------------------------------- boot run
 Limit-Log
-Write-Log '----- run start -----'
+
+# Only one apply at a time (boot and service-restart runs can coincide)
+$applyMutex = New-Object Threading.Mutex($false, 'Global\LConnectAutoRunApply')
+try { $gotMutex = $applyMutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $gotMutex = $true }
+if (-not $gotMutex) { Write-Log 'Another apply run is in progress; skipping this one.'; exit 0 }
+
+if ($Reapply) {
+    Write-Log '----- reapply (L-Connect service restarted) -----'
+    if (Get-LConnectProcesses) { Write-Log 'L-Connect app is open, so it handles the profiles; nothing to do.'; exit 0 }
+} else {
+    Write-Log '----- run start -----'
+}
 if (-not (Test-Admin)) { Write-Log 'Not elevated: starting the service may fail. Use Install.cmd.' }
 
 # 0. Re-apply: keep L-Connect / OpenRGB from starting on their own (L-Connect may re-add
